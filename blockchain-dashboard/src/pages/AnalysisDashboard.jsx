@@ -3,6 +3,8 @@ import MetricsPanel from "../components/MetricsPanel";
 import RecommendationsPanel from "../components/RecommendationsPanel";
 import axios from "axios";
 
+const BACKEND_URL = "http://127.0.0.1:8000"; // 👈 FastAPI
+
 export default function AnalysisDashboard({ blockchain }) {
   const [tpsData, setTpsData] = useState([]);
   const [gasData, setGasData] = useState([]);
@@ -11,40 +13,53 @@ export default function AnalysisDashboard({ blockchain }) {
   const [congestion, setCongestion] = useState(0.4);
 
   useEffect(() => {
-    // Mock TPS data
-    setTpsData([
-      { time: "10:00", tps: 45 },
-      { time: "10:05", tps: 50 },
-      { time: "10:10", tps: 55 },
-      { time: "10:15", tps: 53 },
-    ]);
+    async function fetchData() {
+      try {
+        // fetch recent blocks
+        const res = await axios.get(`${BACKEND_URL}/metrics/live/recent?n=20`);
+        const blocks = res.data;
 
-    // Mock Gas Fee data
-    setGasData([
-      { time: "10:00", gas: 20 },
-      { time: "10:05", gas: 25 },
-      { time: "10:10", gas: 22 },
-      { time: "10:15", gas: 18 },
-    ]);
+        // Transform into recharts format
+        setTpsData(
+          blocks.map((b) => ({
+            time: new Date(b.timestamp).toLocaleTimeString(),
+            tps: b.tps_estimate,
+          }))
+        );
 
-    // Mock Block Size data
-    setBlockData([
-      { time: "10:00", size: 1.2 },
-      { time: "10:05", size: 1.3 },
-      { time: "10:10", size: 1.5 },
-      { time: "10:15", size: 1.4 },
-    ]);
+        setGasData(
+          blocks.map((b) => ({
+            time: new Date(b.timestamp).toLocaleTimeString(),
+            gas: b.avg_fee_per_tx,
+          }))
+        );
 
-    // Mock Congestion
-    setCongestion(0.6);
+        setBlockData(
+          blocks.map((b) => ({
+            time: new Date(b.timestamp).toLocaleTimeString(),
+            size: b.tx_count, // or replace with block size if API gives
+          }))
+        );
 
-    // Mock AI Recommendations
-    setRecommendations({
-      action: "Execute Now",
-      feeRange: "0.00021 - 0.00025 ETH",
-      time: 30,
-      confidence: 92,
-    });
+        // latest block (for congestion + recommendations)
+        const latest = await axios.get(`${BACKEND_URL}/metrics/live/latest`);
+        const lb = latest.data;
+
+        setCongestion(Math.min(lb.tps_estimate / 5000, 1)); // crude estimate
+        setRecommendations({
+          action: lb.tps_estimate > 2000 ? "Wait" : "Execute Now",
+          feeRange: `${lb.avg_fee_per_tx} lamports`,
+          time: 30,
+          confidence: 85,
+        });
+      } catch (err) {
+        console.error("Error fetching data:", err);
+      }
+    }
+
+    fetchData();
+    const interval = setInterval(fetchData, 10000); // refresh every 10s
+    return () => clearInterval(interval);
   }, [blockchain]);
 
   return (
