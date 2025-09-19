@@ -60,3 +60,6 @@ share/python-wheels/
 
 # OS
 Thumbs.db
+
+
+blockenv/
