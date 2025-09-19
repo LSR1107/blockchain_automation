@@ -5,6 +5,8 @@ from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta
 from backend.solana_api import get_latest_block_info, get_recent_blocks
 from fastapi.middleware.cors import CORSMiddleware
+from backend.simulation_runner import run_simulation
+from backend.etherium_api import get_latest_eth_block_info, get_recent_eth_blocks
 
 app = FastAPI()
 app.add_middleware(
@@ -25,20 +27,32 @@ db = client[DB_NAME]
 def root():
     return {"message": "🚀 FastAPI backend is running!"}
 
+"""Solana and Etherium live data is being collected here"""
+@app.get("/metrics/{chain}/live/latest")
+def latest_block(chain: str):
+    if chain.lower() == "solana":
+        return get_latest_block_info() or {"error": "Solana block fetch failed"}
+    elif chain.lower() == "ethereum":
+        return get_latest_eth_block_info() or {"error": "Ethereum block fetch failed"}
+    else:
+        return {"error": f"Unsupported chain: {chain}"}
 
-@app.get("/metrics/live/latest")
-def latest_block():
-    """Latest block info (slot, time, txn count)."""
-    return get_latest_block_info() or {"error": "Block fetch failed"}
+
+@app.get("/metrics/{chain}/live/recent")
+def recent_blocks(chain: str, n: int = 50):
+    if chain.lower() == "solana":
+        return get_recent_blocks(n_blocks=n)
+    elif chain.lower() == "ethereum":
+        return get_recent_eth_blocks(n_blocks=n)
+    else:
+        return {"error": f"Unsupported chain: {chain}"}
 
 
-@app.get("/metrics/live/recent")
-def recent_blocks(n: int = 50):
-    """
-    Fetch last N blocks directly from RPC.
-    Example: /metrics/live/recent?n=20
-    """
-    return get_recent_blocks(n_blocks=n)
+""" This is the simulation part connecting the transactions """
+@app.get("/simulate/btc")
+def simulate_btc_tx():
+    result = run_simulation()
+    return result
 
 
 """this is the part which is connected to mongodb we will continue tomorrow."""
