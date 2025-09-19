@@ -3,7 +3,7 @@ import MetricsPanel from "../components/MetricsPanel";
 import RecommendationsPanel from "../components/RecommendationsPanel";
 import axios from "axios";
 
-const BACKEND_URL = "http://127.0.0.1:8000"; // 👈 FastAPI
+const BACKEND_URL = "https://e22aad26db98.ngrok-free.app"; // 👈 FastAPI
 
 export default function AnalysisDashboard({ blockchain }) {
   const [tpsData, setTpsData] = useState([]);
