@@ -52,7 +52,6 @@ def get_latest_block_info():
         "transaction_count": len(txs),
         "total_fees": fees,
         "avg_fee_per_tx": fees / len(txs) if txs else 0,
-        # TPS is tricky per block: Solana ~400ms per slot → scale to per second
         "tps_estimate": len(txs) / 0.4 if txs else 0
     }
 
