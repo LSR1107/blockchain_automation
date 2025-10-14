@@ -41,6 +41,7 @@ def latest_block(chain: str):
         return {"error": f"Unsupported chain: {chain}"}
 
 
+
 @app.get("/metrics/{chain}/live/recent")
 def recent_blocks(chain: str, n: int = 50):
     if chain.lower() == "solana":
