@@ -7,6 +7,7 @@ from backend.solana_api import get_latest_block_info, get_recent_blocks
 from fastapi.middleware.cors import CORSMiddleware
 from backend.simulation_runner import run_simulation
 from backend.etherium_api import get_latest_eth_block_info, get_recent_eth_blocks
+from backend.bitcoin_api import get_latest_btc_block_info, get_recent_btc_blocks
 
 app = FastAPI()
 app.add_middleware(
@@ -34,8 +35,11 @@ def latest_block(chain: str):
         return get_latest_block_info() or {"error": "Solana block fetch failed"}
     elif chain.lower() == "ethereum":
         return get_latest_eth_block_info() or {"error": "Ethereum block fetch failed"}
+    elif chain.lower() == "bitcoin":
+        return get_latest_btc_block_info() or {"error": "Bitcoin block fetch failed"}
     else:
         return {"error": f"Unsupported chain: {chain}"}
+
 
 
 @app.get("/metrics/{chain}/live/recent")
@@ -44,6 +48,8 @@ def recent_blocks(chain: str, n: int = 50):
         return get_recent_blocks(n_blocks=n)
     elif chain.lower() == "ethereum":
         return get_recent_eth_blocks(n_blocks=n)
+    elif chain.lower() == "bitcoin":
+        return get_recent_btc_blocks(n_blocks=n)
     else:
         return {"error": f"Unsupported chain: {chain}"}
 
