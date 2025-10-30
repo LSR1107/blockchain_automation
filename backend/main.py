@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from motor.motor_asyncio import AsyncIOMotorClient
 import torch
 from fastapi.responses import JSONResponse
@@ -8,6 +9,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.simulation_runner import run_simulation
 from backend.etherium_api import get_latest_eth_block_info, get_recent_eth_blocks
 from backend.bitcoin_api import get_latest_btc_block_info, get_recent_btc_blocks
+from Analysis_backend.ETH_GNN_results import run_eth_gnn_analysis
+from Analysis_backend.ETH_ALSTM_results import run_eth_alstm_analysis
+from Analysis_backend.BTC_ALSTM_results import run_btc_alstm_analysis
+from Analysis_backend.BTC_GNN_results import run_btc_gnn_analysis
+
 
 app = FastAPI()
 app.add_middleware(
@@ -17,6 +23,10 @@ app.add_middleware(
     allow_methods=["*"],  
     allow_headers=["*"],  
 )
+
+
+app.mount("/static", StaticFiles(directory="backend/static"), name="static")
+
 # --- MongoDB connection ---
 MONGO_URI = "mongodb://localhost:27017"   
 DB_NAME = "solana_db"
@@ -54,11 +64,58 @@ def recent_blocks(chain: str, n: int = 50):
         return {"error": f"Unsupported chain: {chain}"}
 
 
+
 """ This is the simulation part connecting the transactions """
 @app.get("/simulate/btc")
 def simulate_btc_tx():
     result = run_simulation()
     return result
+
+
+
+""" This is the analysis part of ETH """
+@app.get("/analysis/eth/gnn")
+def eth_gnn_analysis(future_steps: int = 10):
+    """
+    Run Ethereum congestion prediction using pretrained GNN model
+    Example: /analysis/eth/gnn?future_steps=10
+    """
+    try:
+        result = run_eth_gnn_analysis(future_steps=future_steps)
+        #return JSONResponse(content=json.loads(result))
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/metrics/eth/alstm-analysis")
+def eth_alstm_analysis():
+    """
+    Run Ethereum Attention-LSTM gas price analysis.
+    """
+    return run_eth_alstm_analysis()
+    
+
+""" This is the analysis part of BTC """
+@app.get("/metrics/btc/alstm-analysis")
+def btc_alstm_analysis():
+    """
+    Run Ethereum Attention-LSTM gas price analysis.
+    """
+    return run_btc_alstm_analysis()
+
+@app.get("/analysis/btc/gnn")
+def eth_gnn_analysis(future_steps: int = 10):
+    """
+    Run Ethereum congestion prediction using pretrained GNN model
+    Example: /analysis/eth/gnn?future_steps=10
+    """
+    try:
+        result = run_btc_gnn_analysis(future_steps=future_steps)
+        #return JSONResponse(content=json.loads(result))
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+    
 
 
 """this is the part which is connected to mongodb we will continue tomorrow."""
