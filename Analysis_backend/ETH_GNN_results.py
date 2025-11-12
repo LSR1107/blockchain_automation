@@ -44,7 +44,7 @@ def predict_with_probabilities(model, block_graphs, tx_graphs, device='cpu', slo
 
 
 # =================== CALIBRATION ===================
-def calibrate_probabilities_to_utilization(model, block_graphs, tx_graphs, true_utilizations, device='cpu'):
+def calibrate_probabilities_to_utilization(model, block_graphs, tx_graphs, true_congestion_scores, threshold, device='cpu'):
     model.eval()
     predicted_probs = []
 
@@ -61,27 +61,67 @@ def calibrate_probabilities_to_utilization(model, block_graphs, tx_graphs, true_
             probs = F.softmax(logits, dim=1)
             predicted_probs.append(probs[0, 1].item())
 
-    reg = LinearRegression()
-    reg.fit(np.array(predicted_probs).reshape(-1, 1), true_utilizations)
+    predicted_probs = np.array(predicted_probs)
 
+     # --- Split data based on threshold ---
+    high_mask = true_congestion_scores > threshold
+    low_mask = ~high_mask
+
+    # --- Train separate linear models for below and above threshold ---
+    reg_low = LinearRegression()
+    reg_high = LinearRegression()
+
+    if np.sum(low_mask) > 1:
+        reg_low.fit(predicted_probs[low_mask].reshape(-1, 1),
+                    true_congestion_scores[low_mask])
+    else:
+        reg_low.coef_ = np.array([0.7 / (predicted_probs.max() + 1e-6)])
+        reg_low.intercept_ = 0.0
+
+    if np.sum(high_mask) > 1:
+        reg_high.fit(predicted_probs[high_mask].reshape(-1, 1),
+                     true_congestion_scores[high_mask])
+    else:
+        reg_high.coef_ = np.array([0.3 / (predicted_probs.max() + 1e-6)])
+        reg_high.intercept_ = threshold
+
+    # --- Define unified mapping function ---
     def prob_to_utilization(prob_high):
-        util = reg.predict(np.array([[prob_high]]))[0]
-        return np.clip(util, 0, 1)
+        """
+        Uses linear interpolation — low range maps to 0–threshold,
+        high range maps to threshold–1.
+        """
+        if prob_high < 0.5:
+            util = reg_low.predict(np.array([[prob_high]]))[0]
+        else:
+            util = reg_high.predict(np.array([[prob_high]]))[0]
 
-    return prob_to_utilization, reg
+        # Ensure smooth boundary
+        util = np.clip(util, 0, 1)
+        return util
+
+    print(f"✅ Calibrated with threshold={threshold:.3f}")
+
+    return prob_to_utilization
 
 
 # =================== PREDICTION + UTILIZATION ===================
 def predict_congestion_with_scores(model, block_graphs, tx_graphs, prob_to_util_fn, device='cpu', util_threshold=0.7, slots=None):
     df = predict_with_probabilities(model, block_graphs, tx_graphs, device, slots)
     df['estimated_utilization'] = df['prob_high'].apply(prob_to_util_fn)
+    min_score, max_score = 0.0, 1.0  # or you can dynamically fetch from block_stats
+    df['estimated_utilization'] = np.interp(
+        df['estimated_utilization'],
+        (df['estimated_utilization'].min(), df['estimated_utilization'].max()),
+        (min_score, max_score)
+    )
     df['estimated_utilization_pct'] = df['estimated_utilization'] * 100
     df['congestion_status'] = df['predicted_class'].map({0: 'LOW', 1: 'HIGH'})
 
     def severity(u):
-        if u < 0.5: return '🟢 LIGHT'
-        elif u < 0.7: return '🟡 MODERATE'
-        elif u < 0.85: return '🟠 HIGH'
+        if u < 0.4: return '🟢 LIGHT'
+        elif u < 0.75: return '🟡 MODERATE'
+        elif u < 0.90: return '🟠 HIGH'
         else: return '🔴 CRITICAL'
     df['severity'] = df['estimated_utilization'].apply(severity)
     return df
@@ -116,8 +156,16 @@ def visualize_probability_analysis(predictions_df, threshold=0.7, save_path="bac
 
 # =================== MAIN ANALYSIS WORKFLOW ===================
 def complete_congestion_analysis(model, block_graphs, tx_graphs, block_stats, device='cpu', future_steps=10):
-    true_utilizations = block_stats['block_utilization'].values[-len(block_graphs):]
-    prob_to_util_fn, _ = calibrate_probabilities_to_utilization(model, block_graphs, tx_graphs, true_utilizations, device)
+    true_congestion_scores = block_stats['congestion_score'].values[-len(block_graphs):]
+    #threshold = block_stats['congestion_score'].quantile(0.70)
+    true_congestion_scores = np.array(true_congestion_scores)
+    true_congestion_scores = np.clip(true_congestion_scores, 0, 1)
+    print(f"minimum congestion score: {true_congestion_scores.min()}")
+    print(f"maximum congestion  score: {true_congestion_scores.max()}")
+    print(f"70 percent of the true congestions scores are: {np.quantile(true_congestion_scores, 0.7)}")
+    threshold = np.quantile(true_congestion_scores, 0.7)
+
+    prob_to_util_fn = calibrate_probabilities_to_utilization(model, block_graphs, tx_graphs, true_congestion_scores, threshold, device)
 
     future_blocks = block_graphs[-future_steps:]
     future_txs = tx_graphs[-future_steps:]

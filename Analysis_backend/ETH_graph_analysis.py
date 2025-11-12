@@ -216,9 +216,9 @@ def build_block_stats_eth(transactions_df):
     )
 
     bs["congestion_score"] = (
-        0.4 * bs["util_norm"] +
-        0.3 * bs["tps_norm"] +
-        0.3 * bs["fee_norm"]
+        0.1 * bs["util_norm"] +
+        0.5 * bs["tps_norm"] +
+        0.4 * bs["fee_norm"]
     )
 
     print("\n✅ Ethereum Block Statistics Built Successfully ✅")

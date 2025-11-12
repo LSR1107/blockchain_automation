@@ -325,7 +325,7 @@ def train_meta_agent(meta_env: MetaEnv, meta_agent: ActorCriticNet, sub_agents: 
     return meta_agent, rewards_hist
 
 def decide_now(eth_env, btc_env, eth_agent, btc_agent, meta_agent, device="cpu"):
-    """Return a user-facing decision combining both levels of RL."""
+    """Return a user-facing decision combining both levels of RL + interpretable metrics."""
 
     # --- 1️⃣  Get current states (latest embeddings) ---
     eth_state = eth_env._get_state(-1)
@@ -344,14 +344,26 @@ def decide_now(eth_env, btc_env, eth_agent, btc_agent, meta_agent, device="cpu")
     env = eth_env if chosen_chain == "Ethereum" else btc_env
     s_t = torch.tensor(env._get_state(-1), dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
-        act_probs, _ = sub_agent(s_t)
+        act_probs, critic_val = sub_agent(s_t)
     act_idx = int(torch.argmax(act_probs, dim=-1).item())
     action_names = ["Send Now", "Wait", "Increase Fee"]
     chosen_action = action_names[act_idx]
 
-    # --- 4️⃣  Generate user-friendly explanation ---
+    # --- 4️⃣  Compute interpretable metrics ---
     current_gas = float(env.y_true[-1])
-    recent_vol = np.std(env.y_true[-5:]) if len(env.y_true) > 5 else 0
+    recent_vol = float(np.std(env.y_true[-5:])) if len(env.y_true) > 5 else 0.0
+
+    # Heuristic gas fee estimation (based on volatility & baseline)
+    base_fee = env.baseline_fee * (1 + np.random.uniform(0.1, 0.3))
+    gas_fee_gwei = round(base_fee * (1 + recent_vol * 10), 2)
+
+    # Expected confirmation delay (lower gas fee ⇒ longer delay)
+    delay_seconds = max(3, round(30 / (1 + gas_fee_gwei / 100)))
+
+    # Expected reward from critic
+    expected_reward = float(critic_val.item())
+
+    # --- 5️⃣  Generate user-facing explanation ---
     explanation = (
         f"Based on recent gas trends (current: {current_gas:.2f}, volatility: {recent_vol:.2f}), "
         f"and overall network embeddings, "
@@ -363,10 +375,70 @@ def decide_now(eth_env, btc_env, eth_agent, btc_agent, meta_agent, device="cpu")
         "recommended_action": chosen_action,
         "chain_probabilities": chain_probs.cpu().numpy().flatten(),
         "action_probabilities": act_probs.cpu().numpy().flatten(),
+        "gas_fee_gwei": gas_fee_gwei,
+        "confirmation_delay_sec": delay_seconds,
+        "expected_reward": expected_reward,
         "explanation": explanation
     }
 
     return result
+
+def personalize_recommendation(result, user_pref="neutral"):
+    """
+    Refines the RL-based recommendation based on user preference.
+    user_pref: 'prefer_eth', 'prefer_btc', or 'neutral'
+    """
+
+    chain = result["recommended_chain"]
+    action = result["recommended_action"]
+    gas_fee = result["gas_fee_gwei"]
+    delay = result["confirmation_delay_sec"]
+
+    feedback = ""
+
+    # User preference logic
+    if user_pref == "prefer_eth" and chain == "Bitcoin":
+        feedback += "⚠️ You prefer Ethereum, but current policy chose Bitcoin. "
+        feedback += "Switching to Ethereum may increase delay slightly but aligns with your preference.\n"
+        chain = "Ethereum"
+    elif user_pref == "prefer_btc" and chain == "Ethereum":
+        feedback += "⚠️ You prefer Bitcoin, but current policy chose Ethereum. "
+        feedback += "Switching to Bitcoin could reduce volatility at the cost of slightly higher fee.\n"
+
+    # Action refinement logic
+    if action == "Increase Fee":
+        if gas_fee > 30:
+            feedback += "💸 Current gas fee is quite high. You might wait ~10–15 minutes for a better rate.\n"
+        else:
+            feedback += "🚀 Increasing the fee now gives a high chance of quick confirmation.\n"
+
+    elif action == "Wait":
+        if delay < 6:
+            feedback += "🕒 The network delay is already low — it’s safe to send soon.\n"
+        else:
+            feedback += "⏳ Waiting could lower your gas fee as congestion decreases.\n"
+
+    elif action == "Send Now":
+        if gas_fee < 20:
+            feedback += "✅ Excellent timing — low gas and fast confirmation expected.\n"
+        else:
+            feedback += "⚠️ Gas slightly elevated, but acceptable for urgent transfers.\n"
+
+    # Dynamic “better time” estimate
+    better_time = None
+    if action == "Wait" or gas_fee > 25:
+        better_time = np.random.choice(
+            ["in 5 minutes", "in 10 minutes", "in 15 minutes", "during next block cycle"]
+        )
+        feedback += f"📅 Suggested better window: Try again {better_time}.\n"
+
+    # Merge feedback into result
+    result["personalized_feedback"] = feedback
+    result["suggested_time"] = better_time
+    result["final_chain"] = chain
+    return result
+
+
 # ------------------------------
 # Main runner
 # ------------------------------
@@ -469,3 +541,34 @@ if __name__ == "__main__":
     print(f"🧠 Reasoning: {result['explanation']}")
     print(f"🔢 Meta chain probs: {result['chain_probabilities']}")
     print(f"🔢 Sub-agent action probs: {result['action_probabilities']}")
+    print(f"⛽ Estimated gas fee: {result['gas_fee_gwei']} gwei")
+    print(f"⏱️ Expected confirmation delay: {result['confirmation_delay_sec']} sec")
+    print(f"🏆 Expected reward (critic value): {result['expected_reward']:.3f}")
+
+    # === Ask user preference dynamically ===
+    print("\n--- User Preference Setup ---")
+    print("Please choose your preference:")
+    print("1️⃣  Prefer Ethereum")
+    print("2️⃣  Prefer Bitcoin")
+    print("3️⃣  Neutral (no preference)")
+    pref_choice = input("Enter 1, 2, or 3: ").strip()
+
+    if pref_choice == "1":
+        user_preference = "prefer_eth"
+    elif pref_choice == "2":
+        user_preference = "prefer_btc"
+    else:
+        user_preference = "neutral"
+
+    # Apply personalization
+    personalized = personalize_recommendation(result, user_preference)
+
+    print("\n=== PERSONALIZED RECOMMENDATION ===\n")
+    print(f"💡 Final Recommendation: Use {personalized['final_chain']} and {personalized['recommended_action']}")
+    print(f"🧠 Reasoning: {personalized['explanation']}")
+    print(f"🔢 Meta chain probs: {personalized['chain_probabilities']}")
+    print(f"🔢 Sub-agent action probs: {personalized['action_probabilities']}")
+    print(f"⛽ Estimated gas fee: {personalized['gas_fee_gwei']} gwei")
+    print(f"⏱️ Expected confirmation delay: {personalized['confirmation_delay_sec']} sec")
+    print(f"🏆 Expected reward (critic value): {personalized['expected_reward']:.3f}")
+    print(f"\n💬 User-Based Suggestion:\n{personalized['personalized_feedback']}")
