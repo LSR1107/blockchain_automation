@@ -4,7 +4,7 @@ import Topbar from "./components/Topbar";
 import Home from "./pages/Home";
 import AnalysisDashboard from "./pages/AnalysisDashboard";
 import SimulationDashboard from "./pages/SimulationDashboard";
-import ApiSettings from "./pages/ApiSettings";
+//import ApiSettings from "./pages/ApiSettings";
 import AboutProject from "./pages/AboutProject";
 
 import { ThemeProvider } from "@mui/material/styles";
@@ -62,8 +62,8 @@ export default function App() {
                 path="/analysis"
                 element={<AnalysisDashboard blockchain={selectedChain} />}
               />
-              <Route path="/simulation" element={<SimulationDashboard />} />
-              <Route path="/api-settings" element={<ApiSettings />} />
+              <Route path="/simulation" element={<SimulationDashboard selectedChain={selectedChain} />} />
+              {/* <Route path="/api-settings" element={<ApiSettings />} /> */}
               <Route path="/about" element={<AboutProject />} />
             </Routes>
           </main>

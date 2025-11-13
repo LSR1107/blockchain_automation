@@ -4,7 +4,7 @@ import RecommendationsPanel from "../components/RecommendationsPanel";
 import GaugeChart from "react-gauge-chart";
 import axios from "axios";
 
-const BACKEND_URL = "https://b9c931a86a8a.ngrok-free.app"; // 👈 FastAPI backend
+const BACKEND_URL = " https://c2a3afd9bd4b.ngrok-free.app"; // 👈 FastAPI backend
 
 export default function AnalysisDashboard({ blockchain }) {
   const [tpsData, setTpsData] = useState([]);

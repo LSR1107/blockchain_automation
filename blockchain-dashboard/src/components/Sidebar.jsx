@@ -8,7 +8,7 @@ export default function Sidebar() {
     { text: "Home", path: "/" },
     { text: "Analysis Dashboard", path: "/analysis" },
     { text: "Simulation Dashboard", path: "/simulation" },
-    { text: "API Settings", path: "/api-settings" },
+    // { text: "API Settings", path: "/api-settings" },
     { text: "About Project", path: "/about" },
   ];
 
