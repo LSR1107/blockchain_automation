@@ -6,7 +6,7 @@ import CountUp from "react-countup";
 import { useNavigate } from "react-router-dom";
 import axios from "axios";
 
-const BACKEND_URL = "https://b9c931a86a8a.ngrok-free.app";
+const BACKEND_URL = " https://c2a3afd9bd4b.ngrok-free.app";
 
 // Custom Tooltip for Treemap
 const CustomTooltip = ({ active, payload }) => {
