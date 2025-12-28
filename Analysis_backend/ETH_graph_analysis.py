@@ -18,7 +18,9 @@ import numpy as np
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
-
+from torch.utils.data import DataLoader
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
 
 # In[3]:
 
@@ -562,9 +564,9 @@ def run_training(block_graphs, tx_graphs, labels, model, epochs=30, batch_size=3
 
     # Extra metrics
     mae = mean_absolute_error(y_true, preds)
-    rmse = mean_squared_error(y_true, preds, squared=False)
+    mse = mean_squared_error(y_true, preds)
     r2 = r2_score(y_true, preds)
-    print(f"\nMAE: {mae:.4f} | RMSE: {rmse:.4f} | R²: {r2:.4f}")
+    print(f"\nMAE: {mae:.4f} | RMSE: {mse:.4f} | R²: {r2:.4f}")
 
     print("\n[Saving validation embeddings and true labels...]")
 
@@ -707,7 +709,7 @@ def main_ethereum():
     print("🚀 ETHEREUM HYBRID GNN FORECAST PIPELINE FINISHED SUCCESSFULLY!")
     print("=" * 60)
 
-    return trained_model, block_graphs, tx_graphs, labels
+    return trained_model, block_graphs, tx_graphs, labels, block_stats
 
 
 # In[9]:
@@ -766,7 +768,7 @@ def calculate_metrics(y_true, y_pred):
 # Run the main function
 if __name__ == "__main__":
     # Train the model
-    model, block_graphs, tx_graphs, labels = main_ethereum()
+    model, block_graphs, tx_graphs, labels, block_stats = main_ethereum()
     
     import pickle
 
@@ -775,11 +777,11 @@ if __name__ == "__main__":
             pickle.dump(data, f)
 
     # Save the data
-    save_data((block_graphs, tx_graphs, labels))
+    save_data((block_graphs, tx_graphs, labels, block_stats))
 
 
 # Save the model and other variables
-    save_model_and_data(model, block_graphs, tx_graphs, labels)
+    #save_model_and_data(model, block_graphs, tx_graphs, labels)
 
     
     # Analyze predictions

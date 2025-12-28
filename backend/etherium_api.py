@@ -102,6 +102,7 @@ def get_recent_eth_blocks(n_blocks=50):
             "tx_count": tx_count,
             "gas_used": gas_used,
             "gas_limit": gas_limit,
+            "gas_price": gas_price,
             "gas_utilization": (gas_used / gas_limit * 100) if gas_limit else 0,
             "total_fees_eth": total_fees / 1e18,
             "avg_fee_per_tx_eth": (total_fees / 1e18 / tx_count) if tx_count else 0,

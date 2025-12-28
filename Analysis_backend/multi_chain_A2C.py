@@ -1,14 +1,14 @@
+# hierarchical_rl_full.py
 """
-hierarchical_rl_full.py
-
 Hierarchical Actor-Critic RL using ALSTM + GNN embeddings + true y_val for reward.
 - Chain-specific sub-agents (ETH/BTC) optimize per-chain actions (send/wait/increase_fee)
 - Meta-agent selects which chain to use (ETH or BTC)
-- Handles mismatched embedding lengths by repeating the smaller modal to match the larger within a chain
+- Handles mismatched embedding lengths by repeating the shorter modality to match the longer
+- Interactive user inputs to compare estimated total costs (native + USD) for ETH and BTC
 """
 
 import os
-from typing import List, Tuple, Dict, Optional
+from typing import Optional, Tuple, Dict, List
 import numpy as np
 import torch
 import torch.nn as nn
@@ -69,15 +69,19 @@ def align_labels_to_length(y: Optional[np.ndarray], target_len: int) -> np.ndarr
 class ChainEnv:
     """
     Chain-level environment using fused embeddings and true next-gas for reward.
+    For ETH: y_true and predicted_gas are interpreted as gas price PER GAS in GWEI.
+             (i.e., 1 gwei = 1e-9 ETH)
+    For BTC: y_true and predicted_gas are interpreted as fee in BTC per transaction (native BTC).
     state vector = [embedding_vector || predicted_gas(if given) || true_gas || volatility]
     Actions: 0=send_now, 1=wait, 2=increase_fee
-    Reward uses true next gas (y_true) to compute actual expected success probability.
+    Reward uses true next gas (y_true) to compute expected success probability.
     """
     def __init__(self,
                  fused_embeddings: np.ndarray,
                  y_true: np.ndarray,
+                 chain: str = "ETH",  # "ETH" or "BTC"
                  predicted_gas: Optional[np.ndarray] = None,
-                 baseline_fee_gwei: float = 1.0,
+                 baseline_fee_native: float = 1.0,  # gwei for ETH, BTC for BTC
                  fee_multiplier: float = 1.5,
                  delay_penalty: float = 0.2,
                  success_bonus: float = 5.0,
@@ -85,12 +89,13 @@ class ChainEnv:
                  volatility_window: int = 5):
         assert fused_embeddings.ndim == 2
         assert len(fused_embeddings) == len(y_true)
+        self.chain = chain.upper()
         self.emb = fused_embeddings.astype(np.float32)
         self.y_true = np.asarray(y_true, dtype=np.float32)
         self.predicted_gas = np.asarray(predicted_gas, dtype=np.float32) if predicted_gas is not None else None
         self.T = len(self.y_true)
         self.D = self.emb.shape[1]
-        self.baseline_fee = float(baseline_fee_gwei)
+        self.baseline_fee_native = float(baseline_fee_native)
         self.mult = float(fee_multiplier)
         self.delay_penalty = float(delay_penalty)
         self.success_bonus = float(success_bonus)
@@ -119,43 +124,48 @@ class ChainEnv:
         # state layout: [embedding..., predicted_gas, true_gas, volatility]
         return np.concatenate([emb, np.array([pg, true_g, vol], dtype=np.float32)], axis=0)
 
-    def _success_prob(self, fee_paid: float, true_gas: float) -> float:
-        # Use true_gas as ground-truth comparator (higher true_gas => need higher fee)
-        x = (fee_paid - true_gas) / self.success_scale
+    def _success_prob(self, fee_paid_native: float, true_native: float) -> float:
+        """
+        Map fee_paid vs true_native to success probability.
+        For ETH: both in GWEI per gas (so higher fee_paid_native relative to true_native increases p).
+        For BTC: both in BTC per tx.
+        success_scale controls slope.
+        """
+        x = (fee_paid_native - true_native) / self.success_scale
         p = 1.0 / (1.0 + np.exp(-x))
         return float(np.clip(p, 0.0, 1.0))
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, dict]:
         assert 0 <= action <= 2
-        true_g = float(self.y_true[self.t])
+        true_native = float(self.y_true[self.t])  # gwei for ETH, BTC for BTC
         done = False
         info = {}
         if action == 0:  # send now
-            fee = self.baseline_fee
-            p = self._success_prob(fee, true_g)
-            reward = self.success_bonus * p - fee - self.delay_penalty * self.delay
+            fee_native = self.baseline_fee_native
+            p = self._success_prob(fee_native, true_native)
+            reward = self.success_bonus * p - fee_native - self.delay_penalty * self.delay
             done = True
-            info = {"action": "send_now", "fee": fee, "success_prob": p}
+            info = {"action": "send_now", "native_fee": fee_native, "success_prob": p}
         elif action == 1:  # wait
             self.delay += 1
-            reward = - self.delay_penalty  # small penalty for waiting
+            reward = - self.delay_penalty
             done = False
             info = {"action": "wait"}
         else:  # increase fee
-            fee = self.baseline_fee * self.mult
-            p = self._success_prob(fee, true_g)
-            reward = self.success_bonus * p - fee - self.delay_penalty * self.delay
+            fee_native = self.baseline_fee_native * self.mult
+            p = self._success_prob(fee_native, true_native)
+            reward = self.success_bonus * p - fee_native - self.delay_penalty * self.delay
             done = True
-            info = {"action": "increase_fee", "fee": fee, "success_prob": p}
+            info = {"action": "increase_fee", "native_fee": fee_native, "success_prob": p}
 
-        # advance time (if done or not done, move to next sample for simplicity)
+        # advance time for simplicity
         self.t = min(self.t + 1, self.T - 1)
         next_state = self._get_state(self.t)
         return next_state, float(reward), bool(done), info
 
 
 # ------------------------------
-# Actor-Critic network (shared)
+# Actor-Critic net (shared)
 # ------------------------------
 class ActorCriticNet(nn.Module):
     def __init__(self, state_dim: int, hidden_dim: int = 128, n_actions: int = 3):
@@ -188,21 +198,15 @@ class ActorCriticNet(nn.Module):
 # Meta environment (chooses chain)
 # ------------------------------
 class MetaEnv:
-    """
-    Meta-env samples one index per chain (or uses last), forms a joint meta-state,
-    and allows meta-agent to choose a chain. The chosen chain's sub-agent performs a rollout and returns cumulative reward.
-    """
     def __init__(self, chain_envs: Dict[str, ChainEnv], sample_mode: str = "random"):
         self.chain_envs = chain_envs
         self.chains = list(chain_envs.keys())
         self.C = len(self.chains)
         self.sample_mode = sample_mode
-        # meta state dimension = sum(chain_state_dims)
-        self.state_dim_per_chain = {k: (v.D + 3) for k, v in chain_envs.items()}  # emb + (pg, true_g, vol)
+        self.state_dim_per_chain = {k: (v.D + 3) for k, v in chain_envs.items()}
         self.state_dim = sum(self.state_dim_per_chain.values())
 
     def reset(self):
-        # sample indices depending on mode; env.reset will return state vector for that chain
         states = []
         for name, env in self.chain_envs.items():
             if self.sample_mode == "random":
@@ -213,49 +217,37 @@ class MetaEnv:
                 idx = env.sample_start()
             env.reset(idx)
             states.append(env._get_state(env.t))
-        meta_state = np.concatenate(states, axis=0).astype(np.float32)
-        return meta_state
+        return np.concatenate(states, axis=0).astype(np.float32)
 
     def step(self, chain_idx: int, sub_agent: ActorCriticNet, rollout_steps: int = 5, device: str = "cpu"):
-        """
-        chain_idx: which chain to pick (integer)
-        sub_agent: chain-specific policy network (ActorCriticNet)
-        Performs a short rollout using greedy policy (or sampling) from sub_agent on chosen chain.
-        Returns next_meta_state, cumulative_reward, done, info
-        """
         assert 0 <= chain_idx < self.C
         chosen_chain = self.chains[chain_idx]
         env = self.chain_envs[chosen_chain]
-
-        # short rollout (apply the sub-agent policy)
         total_reward = 0.0
         done = False
-        for step in range(rollout_steps):
+        for _ in range(rollout_steps):
             s = torch.tensor(env._get_state(env.t), dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
                 probs, _ = sub_agent(s)
-            # choose greedy or sample; use greedy to reflect sub-agent policy exploitation in meta rollout
             action = int(torch.argmax(probs, dim=-1).item())
-            next_state, reward, done, info = env.step(action)
+            _, reward, done, _ = env.step(action)
             total_reward += reward
             if done:
                 break
 
-        # Build next meta-state by sampling/resetting all chains
         next_states = []
         for name, ch in self.chain_envs.items():
-            # for diversity, sample new index for non-chosen chains too (or keep)
             if self.sample_mode == "random":
                 ch.reset(ch.sample_start())
             else:
-                ch.reset(ch.t)  # keep
+                ch.reset(ch.t)
             next_states.append(ch._get_state(ch.t))
         next_meta = np.concatenate(next_states, axis=0).astype(np.float32)
         return next_meta, float(total_reward), done, {"chosen_chain": chosen_chain}
 
 
 # ------------------------------
-# Training helpers
+# Training helpers (unchanged)
 # ------------------------------
 def train_sub_agent(env: ChainEnv, model: ActorCriticNet, n_episodes: int = 400, gamma: float = 0.99, lr: float = 3e-4, device: str = "cpu"):
     model.to(device)
@@ -288,7 +280,6 @@ def train_sub_agent(env: ChainEnv, model: ActorCriticNet, n_episodes: int = 400,
         if ep % 50 == 0:
             print(f"[SubAgent] Ep {ep}/{n_episodes} avg_recent={np.mean(rewards_hist[-200:]) if len(rewards_hist)>=1 else np.mean(rewards_hist):.4f}")
     return model, rewards_hist
-
 
 def train_meta_agent(meta_env: MetaEnv, meta_agent: ActorCriticNet, sub_agents: List[ActorCriticNet],
                      n_episodes: int = 800, gamma: float = 0.95, lr: float = 3e-4, rollout_steps: int = 5, device: str = "cpu"):
@@ -324,119 +315,337 @@ def train_meta_agent(meta_env: MetaEnv, meta_agent: ActorCriticNet, sub_agents: 
             print(f"[Meta] Ep {ep}/{n_episodes} avg_recent={np.mean(rewards_hist[-200:]) if len(rewards_hist)>=1 else np.mean(rewards_hist):.4f}")
     return meta_agent, rewards_hist
 
-def decide_now(eth_env, btc_env, eth_agent, btc_agent, meta_agent, device="cpu"):
-    """Return a user-facing decision combining both levels of RL + interpretable metrics."""
 
-    # --- 1️⃣  Get current states (latest embeddings) ---
-    eth_state = eth_env._get_state(-1)
-    btc_state = btc_env._get_state(-1)
+# ------------------------------
+# Utility: native -> USD conversion
+# ------------------------------
+def eth_gwei_to_usd(gwei_value: float, eth_usd_price: float, gas_units: int = 21000) -> Tuple[float, float]:
+    """
+    Convert gas price (gwei per gas) to total ETH fee and USD.
+    Returns (eth_fee, usd_value)
+    """
+    eth_fee = gwei_value * 1e-9 * gas_units  # ETH
+    usd = eth_fee * eth_usd_price
+    return eth_fee, usd
+
+def btc_native_to_usd(btc_fee: float, btc_usd_price: float) -> Tuple[float, float]:
+    """
+    btc_fee is in BTC (native) per transaction.
+    Return (btc_fee, usd)
+    """
+    usd = btc_fee * btc_usd_price
+    return btc_fee, usd
+
+
+def decide_now(
+    eth_env: ChainEnv,
+    btc_env: ChainEnv,
+    eth_agent: ActorCriticNet,
+    btc_agent: ActorCriticNet,
+    meta_agent: ActorCriticNet,
+    eth_usd_price: float,
+    btc_usd_price: float,
+    device: str = "cpu"
+):
+    """
+    Runs one meta-decision + sub-decision step using trained agents
+    and returns cost + recommendation info.
+
+    Notes:
+    - ALWAYS computes both ETH and BTC predictions (so API finalize/predict can use either).
+    - Uses env.t for the current pointer (consistent with ChainEnv.reset).
+    """
+
+    # ========================
+    # 1. GET CURRENT STATES
+    # ========================
+    eth_state = eth_env._get_state(eth_env.t)
+    btc_state = btc_env._get_state(btc_env.t)
+
+    # Combine for meta-agent
     meta_state = np.concatenate([eth_state, btc_state], axis=0)
-    meta_state_t = torch.tensor(meta_state, dtype=torch.float32, device=device).unsqueeze(0)
+    meta_tensor = torch.tensor(meta_state, dtype=torch.float32).unsqueeze(0).to(device)
 
-    # --- 2️⃣  Meta-agent: choose which chain ---
+    # ========================
+    # 2. META CHAIN SELECTION
+    # ========================
     with torch.no_grad():
-        chain_probs, _ = meta_agent(meta_state_t)
-    chain_idx = int(torch.argmax(chain_probs, dim=-1).item())
-    chosen_chain = ["Ethereum", "Bitcoin"][chain_idx]
+        meta_probs, _ = meta_agent(meta_tensor)
 
-    # --- 3️⃣  Sub-agent: decide action for that chain ---
-    sub_agent = eth_agent if chosen_chain == "Ethereum" else btc_agent
-    env = eth_env if chosen_chain == "Ethereum" else btc_env
-    s_t = torch.tensor(env._get_state(-1), dtype=torch.float32, device=device).unsqueeze(0)
+    meta_probs_np = meta_probs.cpu().numpy()[0]
+    chain_idx = int(torch.argmax(meta_probs, dim=-1).item())
+
+    chosen_chain = "ETH" if chain_idx == 0 else "BTC"
+    chosen_env = eth_env if chosen_chain == "ETH" else btc_env
+    chosen_agent = eth_agent if chosen_chain == "ETH" else btc_agent
+
+    # ========================
+    # 3. SUB ACTION SELECTION
+    # ========================
+    chosen_state = torch.tensor(
+        chosen_env._get_state(chosen_env.t),
+        dtype=torch.float32
+    ).unsqueeze(0).to(device)
+
     with torch.no_grad():
-        act_probs, critic_val = sub_agent(s_t)
-    act_idx = int(torch.argmax(act_probs, dim=-1).item())
-    action_names = ["Send Now", "Wait", "Increase Fee"]
-    chosen_action = action_names[act_idx]
+        action_probs, critic_val = chosen_agent(chosen_state)
 
-    # --- 4️⃣  Compute interpretable metrics ---
-    current_gas = float(env.y_true[-1])
-    recent_vol = float(np.std(env.y_true[-5:])) if len(env.y_true) > 5 else 0.0
+    action_probs_np = action_probs.cpu().numpy()[0]
+    action_idx = int(torch.argmax(action_probs, dim=-1).item())
 
-    # Heuristic gas fee estimation (based on volatility & baseline)
-    base_fee = env.baseline_fee * (1 + np.random.uniform(0.1, 0.3))
-    gas_fee_gwei = round(base_fee * (1 + recent_vol * 10), 2)
+    ACTION_MAP = {
+        0: "send_now",
+        1: "wait",
+        2: "increase_fee"
+    }
+    chosen_action = ACTION_MAP.get(action_idx, "wait")
 
-    # Expected confirmation delay (lower gas fee ⇒ longer delay)
-    delay_seconds = max(3, round(30 / (1 + gas_fee_gwei / 100)))
+    # ========================
+    # 4. ALWAYS COMPUTE BOTH NATIVE/PNDS
+    # ========================
+    # ETH: interpret y_true as **(unit used in your dataset)**. Keep same scale as you were using before.
+    # Here we keep the same small-floor behavior you had to avoid zeros.
+    eth_true_raw = float(eth_env.y_true[eth_env.t])
+    btc_true_raw = float(btc_env.y_true[btc_env.t])
 
-    # Expected reward from critic
-    expected_reward = float(critic_val.item())
+    # small floors to avoid zero/None (adjust if your labels are in WEI vs GWEI)
+    predicted_eth_gwei = float(max(eth_true_raw, 0.0001))   # assume eth_true_raw is in GWEI (as before)
+    predicted_btc_fee = float(max(btc_true_raw, 1e-8))      # BTC native per tx
 
-    # --- 5️⃣  Generate user-facing explanation ---
+    # ========================
+    # 5. TREND & VOLATILITY (for chosen chain)
+    # ========================
+    true_native = float(chosen_env.y_true[chosen_env.t])
+    if chosen_env.t > 0:
+        native_delta = true_native - float(chosen_env.y_true[chosen_env.t - 1])
+    else:
+        native_delta = 0.0
+
+    volatility = float(abs(native_delta))
+
+    # ========================
+    # 6. COST CALCULATION (single tx defaults)
+    # ========================
+    if chosen_chain == "ETH":
+        # convert gwei -> ETH for one simple tx using 21000 gas (match your helper eth_gwei_to_usd if needed)
+        estimated_single_tx_native = predicted_eth_gwei * 1e-9 * 21000
+        estimated_single_tx_usd = estimated_single_tx_native * eth_usd_price
+        native_display = f"{predicted_eth_gwei:.6f} GWEI"
+    else:
+        estimated_single_tx_native = predicted_btc_fee
+        estimated_single_tx_usd = estimated_single_tx_native * btc_usd_price
+        native_display = f"{predicted_btc_fee:.8f} BTC"
+
+    # ========================
+    # 7. ADVANCE POINTER (safe)
+    # ========================
+    chosen_env.t = min(chosen_env.t + 1, chosen_env.T - 1)
+
+    # ========================
+    # 8. CONFIRMATION DELAY heuristic
+    # ========================
+    if chosen_action == "send_now":
+        delay = 30
+    elif chosen_action == "wait":
+        delay = 120
+    else:  # increase_fee
+        delay = 20
+
+    # explanation string
     explanation = (
-        f"Based on recent gas trends (current: {current_gas:.2f}, volatility: {recent_vol:.2f}), "
-        f"and overall network embeddings, "
-        f"the meta-policy prefers {chosen_chain} with action '{chosen_action}'."
+        f"Meta-policy selected {chosen_chain} based on recent trend ∆={native_delta:.6f} "
+        f"and volatility={volatility:.6f}. Sub-agent chose action: {chosen_action}."
     )
 
-    result = {
+    # ========================
+    # 9. RETURN (all numeric / no None)
+    # ========================
+    return {
         "recommended_chain": chosen_chain,
         "recommended_action": chosen_action,
-        "chain_probabilities": chain_probs.cpu().numpy().flatten(),
-        "action_probabilities": act_probs.cpu().numpy().flatten(),
-        "gas_fee_gwei": gas_fee_gwei,
-        "confirmation_delay_sec": delay_seconds,
-        "expected_reward": expected_reward,
+
+        "chain_probabilities": meta_probs_np,    # caller often .tolist()s this
+        "action_probabilities": action_probs_np,
+
+        # both predictions always present as floats
+        "predicted_eth_gwei": float(predicted_eth_gwei),
+        "predicted_btc_fee": float(predicted_btc_fee),
+
+        "native_display": native_display,
+        "estimated_single_tx_native_amount": float(estimated_single_tx_native),
+        "estimated_single_tx_usd_amount": float(estimated_single_tx_usd),
+
+        "current_native_value": float(true_native),
+        "native_delta": float(native_delta),
+        "volatility": float(volatility),
+
+        "expected_reward": float(critic_val.item()),
+        "confirmation_delay_sec": int(delay),
+
         "explanation": explanation
     }
 
-    return result
 
-def personalize_recommendation(result, user_pref="neutral"):
+
+# ------------------------------
+# Personalize & compare costs (interactive)
+# ------------------------------
+def personalize_and_compare(result, eth_env, btc_env, eth_usd_price=3100.0, btc_usd_price=99000.0):
     """
-    Refines the RL-based recommendation based on user preference.
-    user_pref: 'prefer_eth', 'prefer_btc', or 'neutral'
+    Ask user for preference and transaction specifics.
+    For ETH: ask tx 'class' (low/medium/high) -> gas units mapping OR accept manual gas units or gas price.
+    For BTC: ask number of transactions or tx size or accept manual BTC fee per tx.
+    Compare estimated totals (USD) and print recommendation and reasoning.
     """
+    print("\n--- User Preference Setup ---")
+    print("Please choose your preference:")
+    print("1️⃣  Prefer Ethereum")
+    print("2️⃣  Prefer Bitcoin")
+    print("3️⃣  Neutral (no preference)")
+    pref_choice = input("Enter 1, 2, or 3: ").strip()
+    if pref_choice == "1":
+        user_pref = "prefer_eth"
+    elif pref_choice == "2":
+        user_pref = "prefer_btc"
+    else:
+        user_pref = "neutral"
 
-    chain = result["recommended_chain"]
-    action = result["recommended_action"]
-    gas_fee = result["gas_fee_gwei"]
-    delay = result["confirmation_delay_sec"]
+    print("\n--- Transaction Details (to compute total fees) ---")
+    # ETH details
+    print("\nEthereum transaction options:")
+    print("a) Low-gas (transfer/approve) ~ 21,000 gas")
+    print("b) Medium (swap/stake) ~ 100,000 gas")
+    print("c) High (complex NFT/DeFi) ~ 300,000 gas")
+    print("d) I know gas units or want to enter gas price directly")
+    eth_choice = input("Choose a/b/c/d for ETH (or press Enter to skip): ").strip().lower()
 
-    feedback = ""
-
-    # User preference logic
-    if user_pref == "prefer_eth" and chain == "Bitcoin":
-        feedback += "⚠️ You prefer Ethereum, but current policy chose Bitcoin. "
-        feedback += "Switching to Ethereum may increase delay slightly but aligns with your preference.\n"
-        chain = "Ethereum"
-    elif user_pref == "prefer_btc" and chain == "Ethereum":
-        feedback += "⚠️ You prefer Bitcoin, but current policy chose Ethereum. "
-        feedback += "Switching to Bitcoin could reduce volatility at the cost of slightly higher fee.\n"
-
-    # Action refinement logic
-    if action == "Increase Fee":
-        if gas_fee > 30:
-            feedback += "💸 Current gas fee is quite high. You might wait ~10–15 minutes for a better rate.\n"
+    eth_total_usd = None
+    eth_native = None
+    if eth_choice in ["a", "b", "c"]:
+        mapping = {"a": 21000, "b": 100000, "c": 300000}
+        gas_units = mapping[eth_choice]
+        # ETH native gas price value (gwei) from environment
+        eth_gwei = eth_env.y_true[-1]
+        eth_fee_eth, eth_fee_usd = eth_gwei_to_usd(eth_gwei, eth_usd_price, gas_units=gas_units)
+        eth_total_usd = eth_fee_usd
+        eth_native = f"{eth_fee_eth:.8f} ETH ({eth_gwei:.3f} gwei)"
+    elif eth_choice == "d":
+        inp = input("Enter gas units (int) or 'g' to enter gas price (gwei): ").strip().lower()
+        if inp == 'g':
+            g = float(input("Enter gas price in GWEI: ").strip())
+            gas_units = int(input("Enter gas units for your tx (e.g. 21000): ").strip())
+            eth_fee_eth, eth_fee_usd = eth_gwei_to_usd(g, eth_usd_price, gas_units=gas_units)
+            eth_total_usd = eth_fee_usd
+            eth_native = f"{eth_fee_eth:.8f} ETH ({g:.3f} gwei)"
         else:
-            feedback += "🚀 Increasing the fee now gives a high chance of quick confirmation.\n"
+            gas_units = int(inp)
+            g = float(input("Enter gas price in GWEI to use (or press Enter to use predicted current): ") or eth_env.y_true[-1])
+            eth_fee_eth, eth_fee_usd = eth_gwei_to_usd(g, eth_usd_price, gas_units=gas_units)
+            eth_total_usd = eth_fee_usd
+            eth_native = f"{eth_fee_eth:.8f} ETH ({g:.3f} gwei)"
+    else:
+        # user skipped ETH input
+        eth_total_usd = None
 
-    elif action == "Wait":
-        if delay < 6:
-            feedback += "🕒 The network delay is already low — it’s safe to send soon.\n"
+    # BTC details
+    print("\nBitcoin transaction options:")
+    print("a) I know the BTC fee per tx (native BTC)")
+    print("b) Estimate by number of inputs/outputs (approx size) -- we'll use a bytes-per-tx heuristic")
+    print("c) Skip BTC input")
+    btc_choice = input("Choose a/b/c for BTC (or press Enter to skip): ").strip().lower()
+
+    btc_total_usd = None
+    btc_native = None
+    if btc_choice == "a":
+        btc_fee_btc = float(input("Enter BTC fee (in BTC) for the transaction, e.g. 0.00023: ").strip())
+        btc_fee_btc, btc_fee_usd = btc_native_to_usd(btc_fee_btc, btc_usd_price)
+        btc_total_usd = btc_fee_usd
+        btc_native = f"{btc_fee_btc:.8f} BTC"
+    elif btc_choice == "b":
+        # Ask approximate inputs/outputs to estimate tx size
+        n_inputs = int(input("Enter number of inputs (typical: 1-3): ").strip() or 1)
+        n_outputs = int(input("Enter number of outputs (typical: 2): ").strip() or 2)
+        # approximate bytes: input ≈ 148 bytes, output ≈ 34 bytes, overhead ≈ 10
+        est_size = 10 + n_inputs * 148 + n_outputs * 34
+        print(f"Estimated tx size: ~{est_size} bytes")
+        # Ask fee rate in sat/vB (or use a default)
+        fee_rate_sat_vb = float(input("Enter fee rate in sat/vB (e.g. 20) or press Enter for default 10: ") or 10.0)
+        # BTC fee in satoshis = fee_rate_sat_vB * vbytes
+        satoshis = fee_rate_sat_vb * est_size
+        btc_fee_btc = satoshis * 1e-8
+        btc_fee_btc, btc_fee_usd = btc_native_to_usd(btc_fee_btc, btc_usd_price)
+        btc_total_usd = btc_fee_usd
+        btc_native = f"{btc_fee_btc:.8f} BTC (≈ {satoshis:.0f} sats)"
+    else:
+        btc_total_usd = None
+
+    # Compare if both present
+    print("\n--- Cost Comparison ---")
+    if eth_total_usd is not None:
+        print(f"Ethereum estimated total fee: {eth_native}  ≈ ${eth_total_usd:.6f} USD")
+    else:
+        print("Ethereum estimate: skipped by user")
+
+    if btc_total_usd is not None:
+        print(f"Bitcoin estimated total fee: {btc_native}  ≈ ${btc_total_usd:.6f} USD")
+    else:
+        print("Bitcoin estimate: skipped by user")
+
+    # If both available, compare and recommend
+    if eth_total_usd is not None and btc_total_usd is not None:
+        if eth_total_usd < btc_total_usd:
+            compare_text = f"💡 Cheaper: Ethereum (by ${btc_total_usd - eth_total_usd:.6f} USD)"
+            compare_choice = "ETH"
         else:
-            feedback += "⏳ Waiting could lower your gas fee as congestion decreases.\n"
+            compare_text = f"💡 Cheaper: Bitcoin (by ${eth_total_usd - btc_total_usd:.6f} USD)"
+            compare_choice = "BTC"
+        print(compare_text)
+    else:
+        compare_choice = None
 
-    elif action == "Send Now":
-        if gas_fee < 20:
-            feedback += "✅ Excellent timing — low gas and fast confirmation expected.\n"
-        else:
-            feedback += "⚠️ Gas slightly elevated, but acceptable for urgent transfers.\n"
+    # Explain why model originally chose that chain
+    model_reason = ""
+    rec_chain = result["recommended_chain"]
+    rec_action = result["recommended_action"]
+    model_reason = (
+        f"Model reason: meta-agent probability distribution = {result['chain_probabilities']}. "
+        f"Sub-agent action probabilities = {result['action_probabilities']}. "
+        f"The model picked {rec_chain} because it had higher expected short-term reward "
+        f"(critic={result['expected_reward']:.3f}) while showing acceptable success probability."
+    )
 
-    # Dynamic “better time” estimate
-    better_time = None
-    if action == "Wait" or gas_fee > 25:
-        better_time = np.random.choice(
-            ["in 5 minutes", "in 10 minutes", "in 15 minutes", "during next block cycle"]
+    # Personalization: if user preference contradicts model, show adjusted suggestion and cost tradeoff
+    final_choice = rec_chain
+    if user_pref == "prefer_eth":
+        final_choice = "Ethereum"
+    elif user_pref == "prefer_btc":
+        final_choice = "Bitcoin"
+
+    # If user forced preference, show tradeoff
+    personalized_feedback = ""
+    if user_pref != "neutral" and final_choice != rec_chain:
+        personalized_feedback = (
+            f"You preferred {final_choice}; note model originally chose {rec_chain}. "
+            f"If you force {final_choice}, expected cost and confirmation times will follow the {final_choice} estimates above."
         )
-        feedback += f"📅 Suggested better window: Try again {better_time}.\n"
+    else:
+        if compare_choice:
+            personalized_feedback = f"Model choice aligns with cost comparison: {compare_choice} cheaper."
+        else:
+            personalized_feedback = "No direct cost comparison (missing input)."
 
-    # Merge feedback into result
-    result["personalized_feedback"] = feedback
-    result["suggested_time"] = better_time
-    result["final_chain"] = chain
-    return result
+    # Assemble final personalization summary
+    summary = {
+        "user_pref": user_pref,
+        "eth_total_usd": eth_total_usd,
+        "btc_total_usd": btc_total_usd,
+        "compare_choice": compare_choice,
+        "final_choice": final_choice,
+        "personalized_feedback": personalized_feedback,
+        "model_reason": model_reason
+    }
+
+    return summary
 
 
 # ------------------------------
@@ -444,25 +653,22 @@ def personalize_recommendation(result, user_pref="neutral"):
 # ------------------------------
 if __name__ == "__main__":
     # Filenames - adjust if yours differ
-    # ETH files
-    ETH_ALSTM = "val_embeddings.npy"         # (N1, d1)
-    ETH_ALSTM_Y = "y_val.npy"                     # (N1,)
-    ETH_GNN = "ETH_GNN_val_embeddings.npy"            # (N2, d2) optional
-    ETH_GNN_Y = "ETH_GNN_y_val_true.npy"              # (N2,) optional
+    ETH_ALSTM = "val_embeddings.npy"
+    ETH_ALSTM_Y = "y_val.npy"
+    ETH_GNN = "ETH_GNN_val_embeddings.npy"
+    ETH_GNN_Y = "ETH_GNN_y_val_true.npy"
 
-    # BTC files
     BTC_ALSTM = "btc_val_embeddings.npy"
     BTC_ALSTM_Y = "btc_y_val.npy"
     BTC_GNN = "Analysis_backend/saved_outputs/val_embeddings.npy"
     BTC_GNN_Y = "Analysis_backend/saved_outputs/y_val_true.npy"
 
-    # load ETH
+    # load embeddings/labels (optional files)
     eth_a = try_load(ETH_ALSTM)
     eth_ay = try_load(ETH_ALSTM_Y)
     eth_g = try_load(ETH_GNN)
     eth_gy = try_load(ETH_GNN_Y)
 
-    # load BTC
     btc_a = try_load(BTC_ALSTM)
     btc_ay = try_load(BTC_ALSTM_Y)
     btc_g = try_load(BTC_GNN)
@@ -472,10 +678,9 @@ if __name__ == "__main__":
     if eth_a is None and eth_g is None:
         print("No ETH embeddings found — creating small dummy ETH data.")
         eth_emb = np.random.randn(500, 16).astype(np.float32)
-        eth_y = (np.sin(np.arange(500)/50.0) + 2.5).astype(np.float32)
+        eth_y = (np.sin(np.arange(500)/50.0) + 2.5).astype(np.float32)  # treat as gwei
     else:
         eth_emb, len_eth = align_and_fuse_modality_arrays(eth_a, eth_g)
-        # prefer ALSTM y if available, else GNN y, else zeros
         if eth_ay is not None:
             eth_y = align_labels_to_length(eth_ay, len_eth)
         elif eth_gy is not None:
@@ -486,7 +691,7 @@ if __name__ == "__main__":
     if btc_a is None and btc_g is None:
         print("No BTC embeddings found — creating small dummy BTC data.")
         btc_emb = np.random.randn(200, 12).astype(np.float32)
-        btc_y = (np.cos(np.arange(200)/40.0) + 2.0).astype(np.float32)
+        btc_y = (np.cos(np.arange(200)/40.0) + 2.0).astype(np.float32)  # treat as BTC per tx
     else:
         btc_emb, len_btc = align_and_fuse_modality_arrays(btc_a, btc_g)
         if btc_ay is not None:
@@ -496,79 +701,62 @@ if __name__ == "__main__":
         else:
             btc_y = np.zeros((len_btc,), dtype=np.float32)
 
-    # Print shapes for diagnostics
     print("ETH fused shape:", eth_emb.shape, "ETH y shape:", eth_y.shape)
     print("BTC fused shape:", btc_emb.shape, "BTC y shape:", btc_y.shape)
 
-    # Build chain envs
-    eth_env = ChainEnv(fused_embeddings=eth_emb, y_true=eth_y, baseline_fee_gwei=1.0, fee_multiplier=1.6)
-    btc_env = ChainEnv(fused_embeddings=btc_emb, y_true=btc_y, baseline_fee_gwei=1.0, fee_multiplier=1.6)
+    # Build chain envs with chain-specific baseline_native values
+    # For ETH baseline_fee_native is in GWEI (gas price per gas)
+    eth_env = ChainEnv(fused_embeddings=eth_emb, y_true=eth_y, chain="ETH", baseline_fee_native=1.0, fee_multiplier=1.6, success_scale=1.0)
+    # For BTC baseline_fee_native is BTC per tx (so pick a representative value ~0.0002 BTC)
+    btc_env = ChainEnv(fused_embeddings=btc_emb, y_true=btc_y, chain="BTC", baseline_fee_native=0.00023, fee_multiplier=1.6, success_scale=0.0001)
+
     chain_envs = {"ETH": eth_env, "BTC": btc_env}
 
-    # Init sub-agents
+    # Create and train sub agents & meta agent --- you can reuse previous saved models if you want
     eth_state_dim = eth_env.D + 3
     btc_state_dim = btc_env.D + 3
     eth_agent = ActorCriticNet(state_dim=eth_state_dim, n_actions=3)
     btc_agent = ActorCriticNet(state_dim=btc_state_dim, n_actions=3)
 
-    # Train sub-agents
     print("\n--- Training ETH sub-agent ---")
-    eth_agent, eth_hist = train_sub_agent(eth_env, eth_agent, n_episodes=300, lr=3e-4)
+    eth_agent, _ = train_sub_agent(eth_env, eth_agent, n_episodes=300, lr=3e-4)
     print("\n--- Training BTC sub-agent ---")
-    btc_agent, btc_hist = train_sub_agent(btc_env, btc_agent, n_episodes=300, lr=3e-4)
+    btc_agent, _ = train_sub_agent(btc_env, btc_agent, n_episodes=300, lr=3e-4)
 
-    # Save sub-agent weights
     torch.save(eth_agent.state_dict(), "eth_agent.pth")
     torch.save(btc_agent.state_dict(), "btc_agent.pth")
     print("Saved eth_agent.pth and btc_agent.pth")
 
-    # Build meta-env and meta-agent
     meta_env = MetaEnv(chain_envs=chain_envs, sample_mode="random")
     meta_agent = ActorCriticNet(state_dim=meta_env.state_dim, n_actions=meta_env.C)
 
     print("\n--- Training Meta-Agent (chain selector) ---")
-    meta_agent, meta_hist = train_meta_agent(meta_env, meta_agent, sub_agents=[eth_agent, btc_agent],
-                                            n_episodes=800, rollout_steps=6, lr=3e-4)
-
+    meta_agent, _ = train_meta_agent(meta_env, meta_agent, sub_agents=[eth_agent, btc_agent], n_episodes=800, rollout_steps=6, lr=3e-4)
     torch.save(meta_agent.state_dict(), "meta_agent.pth")
     print("Saved meta_agent.pth")
 
-    print("\nTraining complete. Models saved: eth_agent.pth, btc_agent.pth, meta_agent.pth")
-
     print("\n=== USER DECISION INTERFACE ===")
-    result = decide_now(eth_env, btc_env, eth_agent, btc_agent, meta_agent)
+    result = decide_now(eth_env, btc_env, eth_agent, btc_agent, meta_agent, eth_usd_price=3100.0, btc_usd_price=99000.0)
+    # Print recommendation summary (native + USD estimates)
     print(f"\n💡 Recommendation: Use {result['recommended_chain']} and {result['recommended_action']}")
     print(f"🧠 Reasoning: {result['explanation']}")
     print(f"🔢 Meta chain probs: {result['chain_probabilities']}")
     print(f"🔢 Sub-agent action probs: {result['action_probabilities']}")
-    print(f"⛽ Estimated gas fee: {result['gas_fee_gwei']} gwei")
+    print(f"🔢 Current native value: {result['native_display']}")
+    print(f"💸 Estimated single tx: {result['estimated_single_tx_native_amount']}  ≈ {result['estimated_single_tx_usd_amount']}")
     print(f"⏱️ Expected confirmation delay: {result['confirmation_delay_sec']} sec")
     print(f"🏆 Expected reward (critic value): {result['expected_reward']:.3f}")
 
-    # === Ask user preference dynamically ===
-    print("\n--- User Preference Setup ---")
-    print("Please choose your preference:")
-    print("1️⃣  Prefer Ethereum")
-    print("2️⃣  Prefer Bitcoin")
-    print("3️⃣  Neutral (no preference)")
-    pref_choice = input("Enter 1, 2, or 3: ").strip()
+    # Ask user and get personalization & comparison
+    summary = personalize_and_compare(result, eth_env, btc_env, eth_usd_price=3100.0, btc_usd_price=99000.0)
 
-    if pref_choice == "1":
-        user_preference = "prefer_eth"
-    elif pref_choice == "2":
-        user_preference = "prefer_btc"
-    else:
-        user_preference = "neutral"
-
-    # Apply personalization
-    personalized = personalize_recommendation(result, user_preference)
-
-    print("\n=== PERSONALIZED RECOMMENDATION ===\n")
-    print(f"💡 Final Recommendation: Use {personalized['final_chain']} and {personalized['recommended_action']}")
-    print(f"🧠 Reasoning: {personalized['explanation']}")
-    print(f"🔢 Meta chain probs: {personalized['chain_probabilities']}")
-    print(f"🔢 Sub-agent action probs: {personalized['action_probabilities']}")
-    print(f"⛽ Estimated gas fee: {personalized['gas_fee_gwei']} gwei")
-    print(f"⏱️ Expected confirmation delay: {personalized['confirmation_delay_sec']} sec")
-    print(f"🏆 Expected reward (critic value): {personalized['expected_reward']:.3f}")
-    print(f"\n💬 User-Based Suggestion:\n{personalized['personalized_feedback']}")
+    print("\n=== PERSONALIZED SUMMARY ===")
+    print(f"User preference: {summary['user_pref']}")
+    if summary['eth_total_usd'] is not None:
+        print(f"Ethereum estimated total fee: ${summary['eth_total_usd']:.6f} USD")
+    if summary['btc_total_usd'] is not None:
+        print(f"Bitcoin estimated total fee: ${summary['btc_total_usd']:.6f} USD")
+    if summary['compare_choice']:
+        print(f"Cheaper according to your inputs: {summary['compare_choice']}")
+    print(f"\n💬 User-Based Suggestion:\n{summary['personalized_feedback']}")
+    print(f"Reason: {summary['model_reason']}")
