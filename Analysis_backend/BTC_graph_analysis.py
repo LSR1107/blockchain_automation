@@ -630,9 +630,9 @@ def run_training(block_graphs, tx_graphs, labels, model, epochs=20, batch_size=1
 
     print(f"✅ Best Validation Accuracy: {best_acc:.4f}")
     mae = mean_absolute_error(y_true, preds)
-    rmse = mean_squared_error(y_true, preds, squared=False)
+    mse = mean_squared_error(y_true, preds)
     r2 = r2_score(y_true, preds)
-    print(f"MAE: {mae:.4f} | RMSE: {rmse:.4f} | R²: {r2:.4f}")
+    print(f"MAE: {mae:.4f} | RMSE: {mse:.4f} | R²: {r2:.4f}")
 
     # Save embeddings
     save_validation_embeddings(model, test_blocks, test_txs, y_test)

@@ -177,7 +177,7 @@ def complete_congestion_analysis(model, block_graphs, tx_graphs, block_stats, de
 
 
 # =================== DATA LOADER ===================
-def load_data(filename='Analysis_backend/data.pkl'):
+def load_data(filename='/Users/samahita/Documents/GitHub/blockchain_automation/data.pkl'):
     with open(filename, 'rb') as f:
         return pickle.load(f)
 
@@ -185,9 +185,9 @@ def load_data(filename='Analysis_backend/data.pkl'):
 # =================== API ENTRYPOINT ===================
 def run_eth_gnn_analysis(future_steps=10):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    block_graphs, tx_graphs, labels = load_data()
+    block_graphs, tx_graphs, labels, block_stats = load_data()
     df = notebook.load_eth_transactions()
-    block_stats = notebook.build_block_stats_eth(df)
+    #block_stats = notebook.build_block_stats_eth(df)
 
     model = notebook.HybridCongestionModel(
         block_in=block_graphs[0].x.shape[1],
